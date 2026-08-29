@@ -24,4 +24,6 @@ EXPOSE 8080
 # the single-flight locks are per-process, and there is exactly ONE upstream
 # LinkedIn session. A second worker would double the upstream call rate and
 # break the breaker.
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+# Shell form so $PORT expands: Fly uses the 8080 default from fly.toml, Render
+# and most PaaS assign a port at runtime and expect the app to honour it.
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]

@@ -1,0 +1,37 @@
+# Render blueprint. Deploy: push to GitHub, then New > Blueprint on render.com
+# and point it at the repo. Secrets are NOT in this file -- see envVars below.
+services:
+  - type: web
+    name: linkedin-profile-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+
+    # The LinkedIn session is minted from an Indian residential IP. LinkedIn is
+    # demonstrably sensitive to the session's client fingerprint changing (see
+    # the User-Agent finding in the README), so deploy to the nearest region
+    # rather than a default US one.
+    region: singapore
+
+    # Liveness, NOT /health. /health returns 503 when the LinkedIn session is
+    # revoked; a platform health check pointed there would restart the service
+    # over an expired cookie, and a restart cannot revive a dead credential.
+    healthCheckPath: /health/live
+
+    # One instance, deliberately. The cache, circuit breaker and single-flight
+    # locks are per-process, and there is exactly ONE upstream LinkedIn session.
+    numInstances: 1
+
+    envVars:
+      # sync:false = Render prompts for the value and stores it encrypted;
+      # it never lands in the repo.
+      - key: LI_COOKIE
+        sync: false
+      - key: LI_USER_AGENT
+        sync: false
+      - key: LI_STATE_DIR
+        value: /tmp/state
+      - key: CACHE_TTL_SECONDS
+        value: "21600"
+      - key: LI_MIN_INTERVAL
+        value: "1.5"
