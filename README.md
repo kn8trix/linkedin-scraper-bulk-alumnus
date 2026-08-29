@@ -5,7 +5,7 @@ Give it a LinkedIn profile URL, get structured JSON back.
 **Live:** https://linkedin-profile-api-4iev.onrender.com/
 
 ```bash
-curl "https://linkedin-profile-api-4iev.onrender.com/api/profile?url=https://www.linkedin.com/in/williamhgates"
+curl "https://linkedin-profile-api-4iev.onrender.com/api/profile?url=https://www.linkedin.com/in/harshilmalani"
 ```
 
 No browser, no headless Chrome, no Selenium. The service makes authenticated
