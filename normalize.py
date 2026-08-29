@@ -83,6 +83,24 @@ def date_text(d):
     return str(y) if y else None
 
 
+def issued_range(entity):
+    """Certifications carry an issue date and (rarely) an expiry -- not a span.
+    Rendering the generic "Feb 2021 - Present" would claim an end date that the
+    payload does not have; LinkedIn itself says "Issued Feb 2021"."""
+    dr = (entity or {}).get("dateRange")
+    if not dr:
+        return None
+    start, end = dr.get("start"), dr.get("end")
+    issued, expires = date_text(start), date_text(end)
+    parts = []
+    if issued:
+        parts.append(f"Issued {issued}")
+    if expires:
+        parts.append(f"Expires {expires}")
+    return {"issued": date(start), "expires": date(end),
+            "text": " \u00b7 ".join(parts) or None}
+
+
 def date_range(entity):
     dr = (entity or {}).get("dateRange")
     if not dr:
@@ -208,7 +226,7 @@ def build_certifications(idx, profile, meta):
         "license_number": text(c, "licenseNumber"),
         "url": c.get("url"),
         "display_source": c.get("displaySource"),
-        "date_range": date_range(c),
+        "date_range": issued_range(c),
     } for c in items]
 
 
@@ -241,6 +259,17 @@ def build_volunteer(idx, profile, meta):
         "description": text(v, "description"),
         "date_range": date_range(v),
     } for v in items]
+
+
+# Sections are always present in the output, even when empty. A key that
+# disappears when a member has no projects would force every consumer to
+# distinguish "missing" from "empty" -- an API should not make them.
+SECTIONS = ["experience", "education", "skills", "certifications",
+            "languages", "projects", "volunteer"]
+
+SCALARS = ["public_identifier", "profile_url", "urn", "member_id", "first_name",
+           "last_name", "full_name", "headline", "about", "location", "industry",
+           "profile_picture", "background_image"]
 
 
 def section_meta(items, paging):
@@ -285,10 +314,10 @@ def normalize(doc):
         }) or None,
         "industry": (idx.get(profile.get("industryUrn")) or {}).get("name"),
         "flags": {
-            "premium": profile.get("premium"),
-            "influencer": profile.get("influencer"),
-            "creator": profile.get("creator"),
-            "memorialized": profile.get("memorialized"),
+            "premium": bool(profile.get("premium")),
+            "influencer": bool(profile.get("influencer")),
+            "creator": bool(profile.get("creator")),
+            "memorialized": bool(profile.get("memorialized")),
         },
         "profile_picture": image_set(profile.get("profilePicture")),
         "background_image": image_set(profile.get("backgroundPicture")),
@@ -300,13 +329,22 @@ def normalize(doc):
         "projects": build_projects(idx, profile, sections),
         "volunteer": build_volunteer(idx, profile, sections),
     }
+    # prune tidies nested nulls, then the contract is restored: every scalar and
+    # every section keeps its key. Without this, prune() silently deletes the
+    # empty `incomplete_sections` list and its own reader raises KeyError.
+    result = prune(result)
+    for key in SCALARS:
+        result.setdefault(key, None)
+    for key in SECTIONS:
+        result.setdefault(key, [])
+    result["flags"] = {k: bool(v) for k, v in (result.get("flags") or {}).items()}
     result["_meta"] = {
         "sections": sections,
         "incomplete_sections": sorted(k for k, v in sections.items()
                                       if not v["complete"]),
         "entities_seen": len(idx.by_urn),
     }
-    return prune(result)
+    return {k: result[k] for k in SCALARS + ["flags"] + SECTIONS + ["_meta"]}
 
 
 def main():
