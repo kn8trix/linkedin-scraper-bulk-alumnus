@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LinkedIn Profile API</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #16181d; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #0a66c2; --accent-ink: #fff;
+    --key: #8250df; --str: #0a7c42; --num: #b3541e; --lit: #0550ae;
+    --err-bg: #fff2f0; --err-line: #f3b8b2; --err-ink: #8a1c11;
+    --ok: #0a7c42;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161a; --panel: #1b1e24; --ink: #e6e8eb; --muted: #9aa3af;
+      --line: #2b2f37; --accent: #4a9eff; --accent-ink: #0b1220;
+      --key: #d2a8ff; --str: #7ee787; --num: #ffa657; --lit: #79c0ff;
+      --err-bg: #2d1614; --err-line: #6a2b23; --err-ink: #ff9c8f;
+      --ok: #7ee787;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; }
+  header { margin-bottom: 22px; }
+  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13.5px; }
+  .sub code { background: var(--panel); border: 1px solid var(--line);
+              padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  form { display: flex; gap: 8px; margin: 20px 0 10px; flex-wrap: wrap; }
+  input[type=text] {
+    flex: 1 1 340px; padding: 11px 13px; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--panel); color: var(--ink); font-size: 14px;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    padding: 11px 18px; border: 0; border-radius: 8px; background: var(--accent);
+    color: var(--accent-ink); font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .opts { display: flex; gap: 16px; align-items: center; color: var(--muted);
+          font-size: 13px; margin-bottom: 18px; flex-wrap: wrap; }
+  .opts label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  .samples { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+  .samples button {
+    background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+    font-weight: 500; font-size: 12.5px; padding: 5px 11px; border-radius: 999px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; overflow: hidden;
+  }
+  .card + .card { margin-top: 16px; }
+  .card-head {
+    display: flex; align-items: center; gap: 12px; padding: 14px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .card-head h2 { font-size: 13px; margin: 0; font-weight: 600;
+                  text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .spacer { flex: 1; }
+  .pill { font-size: 11.5px; padding: 3px 9px; border-radius: 999px;
+          border: 1px solid var(--line); color: var(--muted); }
+  .pill.hit { color: var(--ok); border-color: currentColor; }
+  .copy { background: transparent; color: var(--muted); border: 1px solid var(--line);
+          font-size: 12px; padding: 4px 10px; border-radius: 6px; font-weight: 500; }
+  .summary { display: flex; gap: 16px; padding: 18px 16px; align-items: flex-start; }
+  .summary img { width: 72px; height: 72px; border-radius: 50%; object-fit: cover;
+                 border: 1px solid var(--line); flex-shrink: 0; background: var(--bg); }
+  .summary .name { font-size: 18px; font-weight: 650; letter-spacing: -0.01em; }
+  .summary .head { margin-top: 2px; }
+  .summary .meta { color: var(--muted); font-size: 13px; margin-top: 5px; }
+  .counts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+  .count { font-size: 11.5px; padding: 3px 9px; border-radius: 6px;
+           border: 1px solid var(--line); color: var(--muted); }
+  .count.gap { color: var(--num); border-color: currentColor; }
+  pre {
+    margin: 0; padding: 16px; overflow-x: auto; font-size: 12.5px; line-height: 1.5;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    max-height: 62vh;
+  }
+  .k { color: var(--key); }  .s { color: var(--str); }
+  .n { color: var(--num); }  .b { color: var(--lit); }
+  .err { background: var(--err-bg); border: 1px solid var(--err-line);
+         color: var(--err-ink); border-radius: 12px; padding: 14px 16px; }
+  .err h3 { margin: 0 0 6px; font-size: 14px; }
+  .err p { margin: 4px 0 0; font-size: 13px; }
+  .muted { color: var(--muted); }
+  footer { margin-top: 26px; color: var(--muted); font-size: 12.5px; }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>LinkedIn Profile API</h1>
+    <div class="sub">
+      Paste a profile URL. Served by <code>GET /api/profile?url=…</code> —
+      see <a href="/docs">/docs</a> for the full schema.
+    </div>
+  </header>
+
+  <form id="f">
+    <input id="q" type="text" spellcheck="false"
+           placeholder="https://www.linkedin.com/in/username" autocomplete="off">
+    <button id="go" type="submit">Fetch</button>
+  </form>
+
+  <div class="opts">
+    <label><input type="checkbox" id="refresh"> bypass cache</label>
+    <label><input type="checkbox" id="raw"> raw LinkedIn response</label>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <div class="samples" id="samples"></div>
+
+  <div id="out"></div>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const out = $('out');
+
+const SAMPLES = ['raj1238', 'williamhgates', 'andrewyng', 'satyanadella'];
+SAMPLES.forEach(s => {
+  const b = document.createElement('button');
+  b.textContent = s; b.type = 'button';
+  b.onclick = () => { $('q').value = 'https://www.linkedin.com/in/' + s; $('f').requestSubmit(); };
+  $('samples').appendChild(b);
+});
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+}
+
+// Minimal JSON syntax highlighter: tokenise the already-formatted text so the
+// output stays byte-identical to JSON.stringify, just coloured.
+function highlight(obj) {
+  const json = JSON.stringify(obj, null, 2);
+  return esc(json).replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    (m) => {
+      let cls = 'n';
+      if (/^"/.test(m)) cls = /:$/.test(m) ? 'k' : 's';
+      else if (/true|false|null/.test(m)) cls = 'b';
+      return '<span class="' + cls + '">' + m + '</span>';
+    });
+}
+
+function summaryCard(d) {
+  const pic = d.profile_picture && d.profile_picture.url;
+  const loc = (d.location && d.location.name) || '';
+  const sections = (d._meta && d._meta.sections) || {};
+  const counts = Object.entries(sections).map(([k, s]) => {
+    const gap = !s.complete;
+    const label = s.total != null && s.total !== s.returned
+      ? `${k} ${s.returned}/${s.total}` : `${k} ${s.returned}`;
+    return `<span class="count${gap ? ' gap' : ''}">${esc(label)}</span>`;
+  }).join('');
+  return `<div class="card">
+    <div class="summary">
+      ${pic ? `<img src="${esc(pic)}" alt="">` : ''}
+      <div>
+        <div class="name">${esc(d.full_name || d.public_identifier || '—')}</div>
+        <div class="head">${esc(d.headline || '')}</div>
+        <div class="meta">${esc([loc, d.industry].filter(Boolean).join(' · '))}</div>
+        <div class="counts">${counts}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function jsonCard(obj, cacheState) {
+  const pill = cacheState
+    ? `<span class="pill${cacheState === 'HIT' ? ' hit' : ''}">cache ${esc(cacheState)}</span>` : '';
+  return `<div class="card">
+    <div class="card-head">
+      <h2>Response</h2><div class="spacer"></div>${pill}
+      <button class="copy" id="copy" type="button">Copy JSON</button>
+    </div>
+    <pre>${highlight(obj)}</pre>
+  </div>`;
+}
+
+function errorCard(status, body) {
+  const b = (body && typeof body === 'object') ? body : {message: String(body)};
+  return `<div class="err">
+    <h3>${esc(b.error || 'error')} <span class="muted">· HTTP ${status}</span></h3>
+    ${b.message ? `<p>${esc(b.message)}</p>` : ''}
+    ${b.remedy ? `<p><strong>Fix:</strong> ${esc(b.remedy)}</p>` : ''}
+    ${b.hint ? `<p class="muted">${esc(b.hint)}</p>` : ''}
+  </div>`;
+}
+
+$('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const value = $('q').value.trim();
+  if (!value) return;
+
+  $('go').disabled = true;
+  $('status').textContent = 'fetching…';
+  out.innerHTML = '';
+
+  const params = new URLSearchParams({url: value});
+  if ($('refresh').checked) params.set('refresh', 'true');
+  if ($('raw').checked) params.set('raw', 'true');
+
+  const t0 = performance.now();
+  try {
+    const res = await fetch('/api/profile?' + params.toString());
+    const ms = Math.round(performance.now() - t0);
+    const body = await res.json();
+    if (!res.ok) {
+      out.innerHTML = errorCard(res.status, body);
+    } else {
+      const cache = res.headers.get('X-Cache');
+      const isNormalized = !$('raw').checked && body && body.public_identifier !== undefined;
+      out.innerHTML = (isNormalized ? summaryCard(body) : '') + jsonCard(body, cache);
+      const copy = $('copy');
+      if (copy) copy.onclick = () => {
+        navigator.clipboard.writeText(JSON.stringify(body, null, 2));
+        copy.textContent = 'Copied';
+        setTimeout(() => copy.textContent = 'Copy JSON', 1200);
+      };
+    }
+    $('status').textContent = `${res.status} · ${ms} ms`;
+  } catch (err) {
+    out.innerHTML = errorCard(0, {error: 'network_error', message: String(err)});
+    $('status').textContent = '';
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+// Surface session health up front -- a dead cookie should be visible before you
+// waste a query on it.
+fetch('/health').then(r => r.json()).then(h => {
+  const s = h.session || {};
+  $('foot').innerHTML = s.error
+    ? `<span style="color:var(--num)">session ${esc(s.error.reason)}</span> — ${esc(s.error.remedy || '')}`
+    : `session ok · authenticated as <strong>${esc(s.authenticated_as || '?')}</strong>
+       · cache ttl ${Math.round(h.cache.ttl_seconds / 3600)}h · auth ${esc(h.auth)}`;
+}).catch(() => {});
+</script>
+</body>
+</html>
