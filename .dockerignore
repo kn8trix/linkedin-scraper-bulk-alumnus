@@ -1,0 +1,10 @@
+# Never bake credentials into an image
+.env
+.venv/
+out/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.DS_Store
+README.md

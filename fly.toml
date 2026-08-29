@@ -1,0 +1,38 @@
+# Rename `app` to something unique before the first deploy.
+app = "linkedin-profile-api"
+
+# The LinkedIn session was created from an Indian residential IP. LinkedIn is
+# demonstrably sensitive to the session's client fingerprint changing (see the
+# User-Agent finding in the README), so deploy close to where the cookie was
+# minted rather than to a default US region.
+primary_region = "bom"
+
+[build]
+
+[env]
+  LI_STATE_DIR = "/tmp/state"
+  CACHE_TTL_SECONDS = "21600"
+  LI_MIN_INTERVAL = "1.5"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  # Kept warm on purpose: a cold start empties the in-process cache, and the
+  # first request after it pays a full upstream round trip.
+  auto_stop_machines = false
+  min_machines_running = 1
+
+  # Liveness, NOT /health. /health reports 503 when the LinkedIn session is
+  # revoked, and restarting the machine cannot revive a dead cookie -- pointing
+  # the platform check there would produce a restart loop.
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/health/live"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

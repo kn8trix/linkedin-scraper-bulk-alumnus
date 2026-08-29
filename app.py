@@ -134,6 +134,19 @@ def check_key(supplied):
 
 # --- routes -----------------------------------------------------------------
 
+@app.get("/health/live")
+def liveness():
+    """Liveness only: is the process up?
+
+    Deliberately separate from /health, which reports 503 when the LinkedIn
+    session is dead. A platform health check pointed at /health would kill and
+    restart the machine over an expired cookie -- a restart cannot fix a
+    credential that is dead in the environment, so that is a crash loop, not a
+    recovery. Point orchestrator checks here.
+    """
+    return {"status": "alive"}
+
+
 @app.get("/health")
 def health():
     healthy = upstream.error is None
