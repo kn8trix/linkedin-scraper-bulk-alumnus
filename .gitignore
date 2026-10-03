@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Runtime logs from local uvicorn runs.
+server.log
+*.log

@@ -169,15 +169,20 @@ class CredentialError(Exception):
 # --- session ----------------------------------------------------------------
 
 class Session:
-    def __init__(self, persist=True):
+    def __init__(self, persist=True, cookie_header=None, user_agent=None):
         load_env()
         self.persist = persist
         self._lock = threading.Lock()
         self._last_call = 0.0
+        self._ephemeral = cookie_header is not None or user_agent is not None
 
-        cookie_header = os.environ.get("LI_COOKIE", "").strip()
-        if cookie_header:
-            self.jar = parse_cookie_header(cookie_header)
+        # Callers may supply credentials explicitly (e.g. the bulk endpoint,
+        # which takes a cookie + UA per request). Falling back to the
+        # environment keeps the CLI and the single-profile service unchanged.
+        raw_cookie = (cookie_header if cookie_header is not None
+                      else os.environ.get("LI_COOKIE", "")).strip()
+        if raw_cookie:
+            self.jar = parse_cookie_header(raw_cookie)
         else:
             li_at = os.environ.get("LI_AT", "").strip()
             jsess = os.environ.get("LI_JSESSIONID", "").strip().strip('"')
@@ -199,7 +204,8 @@ class Session:
         # reads as session hijacking and gets the token revoked server-side,
         # usually within minutes. A fallback would destroy the cookie it is
         # handed, so an unset value is a hard error.
-        self.ua = os.environ.get("LI_USER_AGENT", "").strip()
+        self.ua = (user_agent if user_agent is not None
+                   else os.environ.get("LI_USER_AGENT", "")).strip()
         if not self.ua:
             raise CredentialError(
                 "LI_USER_AGENT is not set, and there is no safe default.\n\n"
@@ -210,9 +216,11 @@ class Session:
                 "  DevTools -> Network -> any linkedin.com request -> Request "
                 "Headers -> copy both `cookie:` and `user-agent:`")
 
+        # Caller-supplied credentials are stateless: never read or write the
+        # on-disk jar, which is keyed to the environment's own credential.
         self.env_fingerprint = hashlib.sha256(
             self.jar["li_at"].encode()).hexdigest()[:16]
-        if self.persist:
+        if self.persist and cookie_header is None:
             self._load_jar()
         self.csrf = self.jar["JSESSIONID"].strip('"')
 
@@ -231,7 +239,7 @@ class Session:
         self.jar.update(saved.get("jar") or {})
 
     def _save_jar(self):
-        if not self.persist:
+        if not self.persist or self._ephemeral:
             return
         try:
             os.makedirs(STATE, exist_ok=True)
@@ -309,6 +317,37 @@ class Session:
                 raise VoyagerError(f"network error reaching LinkedIn: {e.reason}") from None
             finally:
                 self._last_call = time.monotonic()
+
+    def get_bytes(self, url, headers=None, timeout=30):
+        """Fetch raw bytes (e.g. a CDN image) with the session's UA.
+
+        The Voyager JSON path is not used here: profile pictures live on
+        media.licdn.com, which is not the API host and answers with an image
+        body rather than JSON. Cookies are still sent, because the signed CDN
+        URL is only valid for the session that received it.
+
+        Returns (bytes, content_type).
+        """
+        req_headers = {
+            "user-agent": self.ua,
+            "accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+            "referer": "https://www.linkedin.com/feed/",
+            "cookie": self.cookie_header(),
+        }
+        req_headers.update(headers or {})
+        req = urllib.request.Request(url, headers=req_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+                return data, ctype
+        except urllib.error.HTTPError as e:
+            raise VoyagerError(
+                f"HTTP {e.code} downloading image from {url}") from None
+        except urllib.error.URLError as e:
+            raise VoyagerError(
+                f"network error downloading image: {e.reason}") from None
 
     def check(self):
         """Returns the authenticated member's public identifier."""

@@ -3,6 +3,7 @@
 HTTP service: LinkedIn profile URL in, structured JSON out.
 
     GET  /api/profile?url=https://www.linkedin.com/in/raj1238
+    POST /api/bulk-scrape   (FormData: cookie, user_agent, profile_urls, file)
     GET  /health
     POST /admin/reload      (re-read credentials without a redeploy)
     GET  /                  (browser UI)
@@ -16,13 +17,30 @@ Design notes that matter more than the code:
 * When the session dies, a breaker trips and every later request is answered
   from memory with 503 + a remedy. Retrying a revoked cookie is how "session
   died" escalates into "account restricted".
+* Bulk scraping takes credentials per request instead of from the environment,
+  because a cookie and its User-Agent are a matched pair. That makes it
+  independent of the shared session -- and its cache and breaker -- so it
+  spaces its own calls and aborts early on a session-level failure.
+* On Render's free tier the service spins down after 15 idle minutes, so a
+  lifespan task pings the PUBLIC url every 10 minutes. A loopback request would
+  not count as inbound traffic and would not keep the service awake.
 """
+import asyncio
+import base64
+import contextlib
+import logging
 import os
+import random
 import threading
 import time
+import urllib.error
+import urllib.request
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import (FastAPI, File, Form, Header, HTTPException, Query,
+                     Request, UploadFile)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 import normalize
 import voyager
@@ -31,12 +49,103 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_TTL = float(os.environ.get("CACHE_TTL_SECONDS", 6 * 3600))
 API_KEYS = {k.strip() for k in os.environ.get("API_KEYS", "").split(",") if k.strip()}
 
+# Attach to uvicorn's own logger: it is configured with a handler by the server,
+# so these lines actually reach Render's log stream. A bare module logger would
+# be silent by default, and an invisible keep-alive is worse than none.
+log = logging.getLogger("uvicorn.error")
+
+# --- keep-alive (Render free tier) ------------------------------------------
+#
+# A Free web service spins down after 15 minutes without INBOUND traffic. A
+# request to our own loopback interface never passes through Render's edge, so
+# it is not counted -- the ping must go to the public URL and re-enter from
+# outside. Render injects RENDER_EXTERNAL_URL for exactly this purpose.
+#
+# The target is /health/live, never /health: /health answers 503 whenever the
+# LinkedIn session is dead, which would make every keep-alive look like a
+# failure. Liveness is the endpoint that is always 200 while the process is up.
+KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "600"))
+KEEPALIVE_INITIAL_DELAY = float(os.environ.get("KEEPALIVE_INITIAL_DELAY_SECONDS", "10"))
+KEEPALIVE_TIMEOUT = float(os.environ.get("KEEPALIVE_TIMEOUT_SECONDS", "10"))
+#: Off unless asked for. On Render that means "RENDER_EXTERNAL_URL is set";
+#: locally, set KEEPALIVE_ENABLED=1 to exercise it against the loopback URL.
+KEEPALIVE_ENABLED = os.environ.get("KEEPALIVE_ENABLED", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def keepalive_target():
+    """The URL to ping, or None when there is nothing sensible to ping.
+
+    Precedence: an explicit override, then Render's public URL, then -- only
+    when explicitly enabled -- the local server.
+    """
+    explicit = os.environ.get("KEEPALIVE_URL", "").strip()
+    if explicit:
+        return explicit
+    external = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if external:
+        return f"{external}/health/live"
+    if KEEPALIVE_ENABLED:
+        return f"http://127.0.0.1:{os.environ.get('PORT', '8080')}/health/live"
+    return None
+
+
+def ping_once(url):
+    """Blocking GET, run in a thread so the event loop is never stalled."""
+    req = urllib.request.Request(url, headers={"user-agent": "keepalive/1.0"})
+    with urllib.request.urlopen(req, timeout=KEEPALIVE_TIMEOUT) as r:
+        return r.status
+
+
+async def keepalive_loop():
+    """Ping the public URL on an interval so Render never sees 15 idle minutes.
+
+    Every failure is caught and logged: the loop must outlive a transient
+    network blip, and it must not take the application down with it.
+    """
+    url = keepalive_target()
+    if not url:
+        log.info("keep-alive: disabled (no RENDER_EXTERNAL_URL and "
+                 "KEEPALIVE_ENABLED is not set)")
+        return
+
+    log.info("keep-alive: pinging %s every %gs after a %gs warm-up",
+             url, KEEPALIVE_INTERVAL, KEEPALIVE_INITIAL_DELAY)
+    await asyncio.sleep(KEEPALIVE_INITIAL_DELAY)
+
+    while True:
+        try:
+            status = await asyncio.to_thread(ping_once, url)
+            log.info("keep-alive: %s -> HTTP %s", url, status)
+        except asyncio.CancelledError:
+            raise  # shutdown, not a failure
+        except Exception as e:
+            # Log and carry on -- a spin-down or a cold start is not fatal, and
+            # crashing the task here would silently stop all future pings.
+            log.warning("keep-alive: %s failed (%s: %s); retrying in %gs",
+                        url, type(e).__name__, e, KEEPALIVE_INTERVAL)
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Start the keep-alive with the app and cancel it cleanly on shutdown."""
+    task = asyncio.create_task(keepalive_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 app = FastAPI(
     title="LinkedIn Profile API",
     version="0.1.0",
     description="Reverse-engineered LinkedIn profile reader. No browser, no "
                 "headless Chrome -- authenticated calls straight to LinkedIn's "
                 "internal Voyager REST API.",
+    lifespan=lifespan,
 )
 
 
@@ -235,6 +344,241 @@ def get_profile(
         return JSONResponse(content=payload, headers={"X-Cache": "MISS"})
 
 
+# --- bulk scraping ----------------------------------------------------------
+
+MAX_BULK_URLS = int(os.environ.get("MAX_BULK_URLS", "50"))
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(2 * 1024 * 1024)))
+IMAGE_TIMEOUT_SECONDS = float(os.environ.get("IMAGE_TIMEOUT_SECONDS", "20"))
+
+# Rate limiting. Bulk calls are the easiest way to get a session revoked, so
+# URLs are spaced with a random delay rather than fired back to back, and a
+# throttle widens that gap for the URLs that follow instead of being retried.
+BULK_DELAY_MIN = float(os.environ.get("BULK_DELAY_MIN_SECONDS", "1.0"))
+BULK_DELAY_MAX = float(os.environ.get("BULK_DELAY_MAX_SECONDS", "3.0"))
+BULK_BACKOFF_FACTOR = float(os.environ.get("BULK_BACKOFF_FACTOR", "2.0"))
+BULK_MAX_BACKOFF = float(os.environ.get("BULK_MAX_BACKOFF_SECONDS", "30"))
+BULK_MAX_CONSECUTIVE_THROTTLES = int(
+    os.environ.get("BULK_MAX_CONSECUTIVE_THROTTLES", "3"))
+
+#: Failures that will repeat identically for every remaining URL. Continuing
+#: after these is not just wasted work -- retrying a revoked cookie is how a
+#: dead session escalates into a restricted account, so the batch stops and the
+#: rest are marked, rather than hammering LinkedIn.
+ABORT_REASONS = frozenset({
+    "bad_credentials", "session_revoked", "session_expired",
+    "challenge_required", "csrf_mismatch",
+})
+
+#: LinkedIn profile pictures are JPEGs on the CDN; the data URL prefix the
+#: contract promises. Overridden per-image if the CDN says otherwise.
+DEFAULT_IMAGE_MIME = "image/jpeg"
+
+
+def extract_urls(text):
+    """Split a blob of text into candidate URLs.
+
+    Accepts one-per-line or comma-separated input, and tolerates CSV rows that
+    wrap the URL in quotes or bury it in a column. Anything that is not a
+    LinkedIn /in/ URL is left for parse_profile_url to reject per-URL.
+    """
+    out = []
+    for line in (text or "").replace(",", "\n").splitlines():
+        candidate = line.strip().strip('"').strip("'").strip()
+        if candidate:
+            out.append(candidate)
+    return out
+
+
+def read_upload(filename, raw):
+    """Decode an uploaded CSV/TXT payload into text, defensively.
+
+    Content is never written to disk -- bulk scraping is stateless by design.
+    """
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": "file_too_large",
+                    "message": f"Upload exceeds {MAX_UPLOAD_BYTES} bytes."})
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", "replace")
+
+
+def fetch_image_data_url(session, url):
+    """Download an image and inline it as a base64 data URL.
+
+    Best-effort: a picture that will not download must not fail the whole
+    profile, so the caller gets None and the field is omitted.
+    """
+    if not url:
+        return None
+    try:
+        data, ctype = session.get_bytes(url, timeout=IMAGE_TIMEOUT_SECONDS)
+    except voyager.VoyagerError:
+        return None
+    if not data:
+        return None
+    mime = ctype if ctype.startswith("image/") else DEFAULT_IMAGE_MIME
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def scrape_one(cookie, user_agent, raw_url):
+    """Scrape a single profile URL into the bulk response item shape.
+
+    Each URL gets its own short-lived session built from the request's cookie
+    and User-Agent. The pair must match the browser that minted them, so they
+    cannot be shared across requests; persistence is disabled so nothing is
+    written to disk.
+    """
+    try:
+        vanity = voyager.parse_profile_url(raw_url)
+    except voyager.BadProfileUrl as e:
+        return {"profile_url": raw_url, "success": False,
+                "error": {"reason": e.reason, "message": str(e)}}
+
+    try:
+        session = voyager.Session(persist=False, cookie_header=cookie,
+                                  user_agent=user_agent)
+    except voyager.CredentialError as e:
+        return {"profile_url": raw_url, "success": False,
+                "error": {"reason": "bad_credentials", "message": str(e)}}
+
+    try:
+        doc, deco = voyager.fetch_profile(session, vanity)
+    except voyager.VoyagerError as e:
+        return {"profile_url": raw_url, "success": False,
+                "error": {"reason": e.reason, "message": str(e),
+                          "remedy": e.remedy}}
+
+    try:
+        payload = normalize.normalize(doc)
+    except ValueError as e:
+        return {"profile_url": raw_url, "success": False,
+                "error": {"reason": "unparsable_profile", "message": str(e)}}
+
+    payload["_meta"]["decoration_version"] = deco
+    payload["_meta"]["fetched_at"] = int(time.time())
+
+    picture = payload.get("profile_picture") or {}
+    data_url = fetch_image_data_url(session, picture.get("url"))
+
+    location = payload.get("location") or {}
+    return {
+        "profile_url": payload.get("profile_url") or raw_url,
+        "full_name": payload.get("full_name"),
+        "headline": payload.get("headline"),
+        "location": location.get("name"),
+        "profile_picture_base64": data_url,
+        "details": payload,
+        "success": True,
+    }
+
+
+@app.post("/api/bulk-scrape")
+def bulk_scrape(
+    cookie: str = Form(..., description="LinkedIn session cookie header"),
+    user_agent: str = Form(..., description="User-Agent matching that cookie"),
+    profile_urls: str = Form("", description="Newline/comma separated URLs"),
+    file: UploadFile = File(None, description="Optional .csv or .txt of URLs"),
+    x_api_key: str = Header(default=""),
+):
+    """Scrape many profiles in one call, returning JSON only -- no disk.
+
+    Profile pictures are downloaded and embedded as base64 data URLs so the
+    whole payload can be inserted straight into a database.
+    """
+    check_key(x_api_key)
+
+    cookie = (cookie or "").strip()
+    user_agent = (user_agent or "").strip()
+    if not cookie:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "missing_cookie",
+                    "message": "`cookie` is required."})
+    if not user_agent:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "missing_user_agent",
+                    "message": "`user_agent` is required and must match the "
+                               "browser session the cookie came from."})
+
+    candidates = extract_urls(profile_urls)
+    if file is not None:
+        raw = file.file.read()
+        candidates.extend(extract_urls(read_upload(file.filename or "", raw)))
+
+    # Deduplicate while preserving first-seen order.
+    seen = set()
+    urls = []
+    for u in candidates:
+        key = u.rstrip("/").lower()
+        if key and key not in seen:
+            seen.add(key)
+            urls.append(u)
+
+    if not urls:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "no_urls",
+                    "message": "Provide `profile_urls` and/or a CSV/TXT file "
+                               "containing at least one URL."})
+    if len(urls) > MAX_BULK_URLS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "too_many_urls",
+                    "message": f"{len(urls)} URLs supplied; the limit is "
+                               f"{MAX_BULK_URLS} per request."})
+
+    data = []
+    backoff = 0.0
+    consecutive_throttles = 0
+    for i, url in enumerate(urls):
+        if i:
+            # Random spacing, widened by any backoff earned on the last call.
+            time.sleep(random.uniform(BULK_DELAY_MIN, BULK_DELAY_MAX) + backoff)
+
+        item = scrape_one(cookie, user_agent, url)
+        data.append(item)
+        if item.get("success"):
+            consecutive_throttles = 0
+            backoff = 0.0
+            continue
+
+        reason = (item.get("error") or {}).get("reason")
+        if reason in ABORT_REASONS:
+            # One dead credential fails every remaining URL the same way.
+            for pending in urls[i + 1:]:
+                data.append({
+                    "profile_url": pending,
+                    "success": False,
+                    "error": {"reason": "aborted",
+                              "message": f"Stopped after '{reason}'; not "
+                                         f"retrying a failing session."},
+                })
+            break
+
+        if reason == "rate_limited":
+            consecutive_throttles += 1
+            backoff = min((backoff or BULK_DELAY_MAX) * BULK_BACKOFF_FACTOR,
+                          BULK_MAX_BACKOFF)
+            if consecutive_throttles >= BULK_MAX_CONSECUTIVE_THROTTLES:
+                for pending in urls[i + 1:]:
+                    data.append({
+                        "profile_url": pending,
+                        "success": False,
+                        "error": {"reason": "aborted",
+                                  "message": "Stopped after repeated "
+                                             "throttling; retry later."},
+                    })
+                break
+
+    return JSONResponse(content={"success": True, "total": len(data),
+                                 "data": data})
+
+
 @app.get("/", include_in_schema=False)
 def index():
     return FileResponse(os.path.join(HERE, "static", "index.html"))
@@ -248,3 +592,24 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         detail = {"error": "http_error", "message": str(detail)}
     return JSONResponse(status_code=exc.status_code, content=detail,
                         headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Missing/!well-formed form fields -> the same JSON error shape as the rest.
+
+    FastAPI's default 422 body is `{"detail": [...]}`, which breaks the promise
+    that every error is an object with `error` and `message`.
+    """
+    fields = sorted({".".join(str(p) for p in e.get("loc", []) if p != "body")
+                     for e in exc.errors()})
+    return JSONResponse(
+        status_code=422,
+        content={"error": "validation_error",
+                 "message": "Invalid request: " + ", ".join(fields)})
+
+
+# Mount the dashboard last so it never shadows the /api, /health and /docs
+# routes declared above; html=True serves index.html at the root.
+app.mount("/", StaticFiles(directory=os.path.join(HERE, "static"), html=True),
+          name="static")

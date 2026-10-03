@@ -35,3 +35,20 @@ services:
         value: "21600"
       - key: LI_MIN_INTERVAL
         value: "1.5"
+      # Bulk scraping spaces URLs with a random delay and backs off on 429s.
+      - key: BULK_DELAY_MIN_SECONDS
+        value: "1.0"
+      - key: BULK_DELAY_MAX_SECONDS
+        value: "3.0"
+      - key: MAX_BULK_URLS
+        value: "50"
+
+      # Keep-alive against Render's 15-minute idle spin-down. Render injects
+      # RENDER_EXTERNAL_URL automatically, which is what enables the loop -- so
+      # there is deliberately no RENDER_EXTERNAL_URL entry here (setting it by
+      # hand risks pinning a stale hostname). 10 minutes stays inside the
+      # window even if a single ping fails.
+      - key: KEEPALIVE_INTERVAL_SECONDS
+        value: "600"
+      - key: KEEPALIVE_INITIAL_DELAY_SECONDS
+        value: "10"

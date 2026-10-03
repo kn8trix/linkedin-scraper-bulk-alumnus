@@ -46,7 +46,10 @@ Both must come from the same request. That is not a style preference — see
 has no default and the app refuses to start without it.
 
 Optional knobs (`API_KEYS`, `CACHE_TTL_SECONDS`, `LI_MIN_INTERVAL`,
-`LI_STATE_DIR`) are documented in `.env.example`.
+`LI_STATE_DIR`, the bulk `BULK_*` / `MAX_BULK_URLS` limits) are documented in
+`.env.example`. Note that the dashboard supplies its own cookie and User-Agent
+per request, so the bulk endpoint works even when `LI_COOKIE` / `LI_USER_AGENT`
+are unset — those are only needed for `GET /api/profile`.
 
 ### CLI
 
@@ -75,6 +78,142 @@ Interactive docs: [`/docs`](https://linkedin-profile-api-4iev.onrender.com/docs)
 hosts and company URLs are rejected with `400` before any upstream call.
 
 Responses carry `X-Cache: HIT|MISS|BYPASS` and `X-Cache-TTL`.
+
+### `POST /api/bulk-scrape`
+
+Scrape many profiles in one call. Accepts `multipart/form-data` (the same shape
+the dashboard submits) and returns JSON only — **nothing is written to disk**,
+so the whole payload can be inserted straight into a database.
+
+| Field | Type | Notes |
+|---|---|---|
+| `cookie` | string, required | The whole LinkedIn `cookie:` header |
+| `user_agent` | string, required | Must match the browser that minted the cookie |
+| `profile_urls` | string, optional | Newline- or comma-separated URLs / identifiers |
+| `file` | file, optional | `.csv` or `.txt` containing URLs |
+| `X-API-Key` | header, optional | Only enforced when `API_KEYS` is set |
+
+`profile_urls` and `file` are merged, whitespace-trimmed and deduplicated
+(case-insensitively, ignoring a trailing slash) before anything is fetched, and
+the order of first appearance is preserved. CSV rows work whether the URL is
+bare, quoted, or sitting in a named column.
+
+Unlike `/api/profile`, credentials are supplied **per request** rather than read
+from the environment, because a cookie and User-Agent are a matched pair tied to
+the browser session that created them. Each URL therefore gets its own
+short-lived session, and the shared cache / circuit breaker are not involved —
+this endpoint is deliberately independent of the long-lived env session.
+
+```bash
+curl -X POST https://linkedin-profile-api-4iev.onrender.com/api/bulk-scrape \
+  -F 'cookie=li_at=...; JSESSIONID="ajax:..."' \
+  -F 'user_agent=Mozilla/5.0 (…) Chrome/151.0.0.0 Safari/537.36' \
+  -F 'profile_urls=https://www.linkedin.com/in/x
+https://www.linkedin.com/in/y' \
+  -F 'file=@urls.csv'
+```
+
+Response:
+
+```jsonc
+{
+  "success": true,
+  "total": 5,
+  "data": [
+    {
+      "profile_url": "https://www.linkedin.com/in/harshilmalani",
+      "full_name": "Harshil Malani",
+      "headline": "ex-sde intern @humantic ai | …",
+      "location": "Surat, Gujarat, India",
+      "profile_picture_base64": "data:image/jpeg;base64,/9j/4AAQ…",
+      "details": { /* the full /api/profile payload */ },
+      "success": true
+    }
+  ]
+}
+```
+
+`profile_picture_base64` is the image **bytes**, inlined as a data URL, so it
+survives the signed CDN link expiring. A picture that cannot be downloaded is
+omitted rather than failing the profile.
+
+**Failures are per item, not per request.** A bad URL or an unreachable profile
+produces `success: false` with an `error` object (`reason`, `message`, and
+usually `remedy`) while the rest of the batch completes:
+
+```jsonc
+{ "profile_url": "https://example.com/in/x", "success": false,
+  "error": { "reason": "bad_profile_url",
+             "message": "not a linkedin.com URL: example.com" } }
+```
+
+#### Rate limiting and back-off
+
+Bulk scraping is the fastest way to get a session revoked, so URLs are spaced
+rather than fired back to back:
+
+- A **random delay** of `BULK_DELAY_MIN_SECONDS`–`BULK_DELAY_MAX_SECONDS`
+  (default 1–3s) is inserted between profiles.
+- A **`rate_limited` response doubles the delay** for the URLs that follow,
+  capped at `BULK_MAX_BACKOFF_SECONDS` (default 30s). A single throttle is
+  recovered from; the batch only gives up after
+  `BULK_MAX_CONSECUTIVE_THROTTLES` (default 3) in a row.
+- A **dead session aborts the batch.** On `session_revoked`, `session_expired`,
+  `challenge_required` or `csrf_mismatch`, the remaining URLs are marked
+  `reason: "aborted"` and no further requests are made — retrying a revoked
+  cookie is how "session died" escalates into "account restricted".
+
+The response always contains one entry per submitted URL, so `total` matches the
+deduplicated input even when the batch stops early.
+
+#### Bulk errors
+
+| HTTP | `error` | Meaning |
+|---|---|---|
+| 400 | `missing_cookie` / `missing_user_agent` | A required credential is blank |
+| 400 | `no_urls` | Neither `profile_urls` nor a file yielded a URL |
+| 400 | `too_many_urls` | More than `MAX_BULK_URLS` (default 50) |
+| 413 | `file_too_large` | Upload exceeds `MAX_UPLOAD_BYTES` (default 2 MB) |
+| 422 | `validation_error` | A required form field was absent |
+
+### Web UI
+
+The service ships a single-page dashboard at [`/`](https://linkedin-profile-api-4iev.onrender.com/)
+(`static/index.html`, Tailwind via CDN, no build step):
+
+1. Paste the **cookie** and matching **User-Agent**.
+2. Add profiles — one URL per line in the textarea, and/or upload a CSV/TXT.
+3. Press **Start Bulk Scrape**.
+
+Results appear in two tabs: **Formatted UI View** renders responsive profile
+cards (avatar, name, headline, location, latest role, education, skills) with
+failed URLs as distinct error cards; **Raw JSON View** shows the exact response
+with *Copy to Clipboard* and *Download JSON File*.
+
+#### Base64 avatars
+
+Card avatars do not use LinkedIn's image URL. They render
+`profile_picture_base64` — the image bytes inlined as a data URL
+(`data:image/jpeg;base64,…`) — because the CDN links are **signed and expire**,
+so a stored URL becomes a broken image within days. A data URL is
+self-contained and survives both that expiry and the LinkedIn session dying,
+which is also what makes it safe to insert straight into a database. If an
+image cannot be downloaded, the avatar falls back to initials.
+
+#### Stateless by design
+
+The dashboard holds results in **in-memory variables only**:
+
+- No `localStorage` / `sessionStorage` — refreshing or closing the tab discards
+  every result *and* the pasted cookie.
+- No server-side persistence — the API never writes scraped profiles to disk or
+  a database, and uploaded CSV/TXT files are parsed in memory and dropped.
+- The bulk endpoint is independent of the shared env session, cache and circuit
+  breaker, so nothing about a bulk run outlives the request.
+
+The only durable state in the whole service is the credential cookie jar under
+`LI_STATE_DIR`, which the *single-profile* endpoint uses to ride an `li_at`
+rotation. Bulk scraping never touches it.
 
 ### Other endpoints
 
@@ -326,6 +465,88 @@ more expensive than the reverse.
 
 ---
 
+## Deploying to Render
+
+The repo ships a [`render.yaml`](render.yaml) blueprint, so deployment is:
+
+1. Push the repo to GitHub.
+2. In the Render Dashboard: **New → Blueprint**, pick the repo, apply.
+3. Fill in the two secrets it prompts for (`LI_COOKIE`, `LI_USER_AGENT`).
+4. Open the service URL and scrape.
+
+Prefer a manual deploy? **New → Web Service**, set **Runtime: Docker**, and let
+it use the repo's `Dockerfile`. No build command or start command is needed —
+the image's `CMD` already honours `$PORT`.
+
+### Environment variables
+
+| Key | Required | Notes |
+|---|---|---|
+| `LI_COOKIE` | for `/api/profile` | Secret. Whole `cookie:` header, one line |
+| `LI_USER_AGENT` | for `/api/profile` | Secret. Must match the cookie's browser |
+| `LI_STATE_DIR` | recommended | `/tmp/state` — writable, ephemeral |
+| `CACHE_TTL_SECONDS` | optional | Default `21600` (6h) |
+| `LI_MIN_INTERVAL` | optional | Upstream spacing, default `1.5` |
+| `BULK_DELAY_MIN/MAX_SECONDS` | optional | Per-URL spacing, default `1`–`3` |
+| `MAX_BULK_URLS` | optional | Default `50` |
+| `KEEPALIVE_INTERVAL_SECONDS` | optional | Default `600` (10 min) |
+| `API_KEYS` | recommended | Comma-separated. **Unset means the API is open** |
+
+`RENDER_EXTERNAL_URL` is injected by Render automatically — do not set it by
+hand, or you risk pinning a stale hostname.
+
+**The bulk endpoint needs no environment credentials.** It takes `cookie` and
+`user_agent` per request, so the dashboard works on a fresh deploy with no
+LinkedIn secrets configured; only `GET /api/profile` reads the environment.
+
+### Deployment notes that matter
+
+- **`healthCheckPath: /health/live`, not `/health`.** `/health` returns 503
+  whenever the LinkedIn session is dead, and a platform check pointed there
+  would restart the container over an expired cookie. A restart cannot revive a
+  dead credential — that is a crash loop, not a recovery.
+- **One worker, one instance.** The cache, circuit breaker and single-flight
+  locks are per-process, and there is exactly one upstream session. The
+  blueprint sets `numInstances: 1` and the image runs `--workers 1`; changing
+  either breaks the breaker and doubles the upstream call rate.
+- **The filesystem is ephemeral.** The cookie jar and decoration pin are lost on
+  every spin-down and redeploy, so the app re-reads credentials from the
+  environment on boot. That is the correct fallback — do not expect the jar to
+  survive.
+- **Region.** The blueprint uses `singapore`, chosen to sit near the session's
+  original geography (see the User-Agent finding below).
+
+### Free tier: spin-down and keep-alive
+
+Render **spins down a Free web service after 15 minutes without inbound
+traffic**, and the next request takes **~1 minute** to cold-start. The blueprint
+mitigates this with an in-process keep-alive: a `lifespan` task pings
+`$RENDER_EXTERNAL_URL/health/live` every 10 minutes, starting 10 seconds after
+boot. Every failure is logged and swallowed, so a blip cannot kill the loop.
+
+**The ping must go to the public URL.** A request to `localhost` never crosses
+Render's edge, is not counted as inbound traffic, and will *not* keep the
+service awake — which is why the target is `RENDER_EXTERNAL_URL` rather than
+`http://localhost:8000`. The endpoint is `/health/live` rather than `/health`
+so that an expired LinkedIn cookie (503) does not make every ping look like a
+failure.
+
+> **An external monitor is still recommended.** The self-ping only works while
+> the service is already awake, so it cannot recover from a spin-down, a
+> crash, or a Render restart — and it does nothing if the app itself fails to
+> boot. Point a free uptime monitor (e.g. **UptimeRobot**) at
+> `https://<your-app>.onrender.com/health` every 5 minutes. That generates
+> genuine inbound traffic from outside Render's network, so it keeps the
+> service warm *and* alerts you when it goes down. Treat the self-ping as a
+> best-effort backstop, not a replacement.
+
+Two other free-tier limits are worth knowing: a workspace gets **750 instance
+hours per month** (a spun-down service does not consume them), and Render may
+suspend a service that makes an uncommonly high volume of *outbound* requests —
+relevant here, since bulk scraping calls LinkedIn once per URL.
+
+---
+
 ## Design notes
 
 There is exactly **one** upstream LinkedIn session, shared by every caller, and
@@ -350,9 +571,9 @@ it is fragile. Most of the architecture follows from that.
 ```
 voyager.py         Voyager client: session, cookie jar, errors, fetch. Stdlib only.
 normalize.py       Raw entity graph -> structured JSON. Pure function.
-app.py             FastAPI service: cache, breaker, single-flight, auth.
+app.py             FastAPI service: cache, breaker, single-flight, auth, keep-alive.
 probe.py           CLI for session diagnostics and capturing fixtures.
-static/index.html  Web UI: rendered profile, JSON view, history, themes.
+static/index.html  Web UI: stateless bulk dashboard, formatted + raw JSON views.
 ```
 
 ---
@@ -371,9 +592,19 @@ static/index.html  Web UI: rendered profile, JSON view, history, themes.
 - **Image URLs are signed and expire.** Persist the bytes, not the URL.
 - **Results are what the authenticated account can see.** Private profiles
   return 404, indistinct from "does not exist" — LinkedIn does not separate them.
-- **One shared session** is the throughput ceiling and single point of failure.
+- **One shared session** is the throughput ceiling and single point of failure
+  for `/api/profile`. Bulk scraping sidesteps it with per-request credentials,
+  at the cost of the cache and circuit breaker that protect that session.
+- **Bulk requests are not authenticated separately**, so the endpoint is a
+  credential-relay: whoever can reach it can run their own cookie through it.
+  Set `API_KEYS` before exposing it to anyone else.
 - **No per-IP rate limiting yet**, and `API_KEYS` is unset on the hosted
-  instance so it can be evaluated freely.
+  instance so it can be evaluated freely. Bulk work is spaced and capped, but a
+  caller can still queue many batches.
+- **The keep-alive is best-effort.** It cannot wake a spun-down service, and it
+  competes with the same 750 monthly instance hours an external monitor would
+  consume — running both keeps the service awake essentially 24/7, which will
+  exhaust the quota before month end.
 - **No tests.** Five real fixtures sit in `out/` and the normalizer is a pure
   function — the suite is the most valuable next commit.
 
